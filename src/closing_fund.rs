@@ -18,7 +18,7 @@ pub fn close_fund(
 
     for (_, market_id) in config.derivative_market_ids.iter().enumerate() {
         let vault_position = querier
-            .query_vanilla_subaccount_position(market_id, &config.subaccount_id)?
+            .query_vanilla_subaccount_position(market_id, &config.fund_subaccount_id)?
             .state;
         ensure_eq!(vault_position, None, ContractError::NonZeroVaultPosition {});
     }

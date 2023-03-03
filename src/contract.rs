@@ -14,8 +14,8 @@ use injective_math::FPDecimal;
 
 use crate::closing_fund::close_fund;
 use crate::error::ContractError;
-use crate::lp_actions::redemptions::get_vault_redemption_response;
-use crate::lp_actions::subscriptions::get_vault_subscription_response;
+use crate::lp_actions::redemptions::get_fund_redemption_response;
+use crate::lp_actions::subscriptions::get_fund_subscription_response;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{
     Config, ADMIN_FEE_POSITIONS, CONFIG, DENOM_DECIMALS, IS_FUND_CLOSED, LP_TOTAL_SUPPLY,
@@ -42,8 +42,9 @@ pub fn instantiate(
             spot_market_ids: msg.spot_market_ids.to_owned(),
             derivative_market_ids: msg.derivative_market_ids.to_owned(),
             quote_denom: msg.quote_denom.to_owned(),
-            subaccount_id: msg.subaccount_id,
+            fund_subaccount_id: msg.fund_subaccount_id,
             performance_fee_rate: msg.performance_fee_rate,
+            min_yearly_roi_for_fees: msg.min_yearly_roi_for_fees,
         },
     )?;
 
@@ -119,11 +120,11 @@ pub fn execute(
             execute_messages(deps, info.sender, injective_messages)
         }
         ExecuteMsg::Subscribe {} => {
-            get_vault_subscription_response(deps, &env, &info.sender, info.funds)
+            get_fund_subscription_response(deps, &env, &info.sender, info.funds)
         }
         ExecuteMsg::Redeem {
             redeemer_subaccount_id,
-        } => get_vault_redemption_response(deps, &env, &info.sender, redeemer_subaccount_id),
+        } => get_fund_redemption_response(deps, &env, &info.sender, redeemer_subaccount_id),
         ExecuteMsg::AdminReceiveFeePositions {
             receiving_subaccount_id,
         } => admin_receive_fee_positions(deps, info.sender, receiving_subaccount_id),
@@ -148,7 +149,7 @@ pub fn admin_receive_fee_positions(
             synthetic_trade: None,
             position_transfer: Some(PositionTransferAction {
                 market_id: market_id.to_owned(),
-                source_subaccount_id: config.subaccount_id.to_owned(),
+                source_subaccount_id: config.fund_subaccount_id.to_owned(),
                 destination_subaccount_id: receiving_subaccount_id.to_owned(),
                 quantity: quantity.to_owned(),
             }),

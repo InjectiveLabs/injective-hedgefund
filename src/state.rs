@@ -15,8 +15,9 @@ pub struct Config {
     pub spot_market_ids: Vec<MarketId>,
     pub derivative_market_ids: Vec<MarketId>,
     pub quote_denom: String,
-    pub subaccount_id: SubaccountId,
+    pub fund_subaccount_id: SubaccountId,
     pub performance_fee_rate: FPDecimal,
+    pub min_yearly_roi_for_fees: FPDecimal, // e.g. 1.1 means min 10% yearly ROI before paying admin fees
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

@@ -1,15 +1,15 @@
-use std::str::FromStr;
-
-use cosmwasm_std::{to_binary, Addr, BankMsg, Coin, DepsMut, Env, Response, StdError, Uint128};
+use cosmwasm_std::{
+    to_binary, Addr, BankMsg, Coin, DepsMut, Env, Response, StdError, Timestamp, Uint128,
+};
 use injective_cosmwasm::{
     privileged_action::{PositionTransferAction, PrivilegedAction},
-    InjectiveMsgWrapper, InjectiveQuerier, InjectiveQueryWrapper, Position, SubaccountId,
+    InjectiveMsgWrapper, InjectiveQuerier, InjectiveQueryWrapper, MarketId, Position, SubaccountId,
 };
 use injective_math::FPDecimal;
 
 use crate::{
     state::{
-        ADMIN_FEE_POSITIONS, ADMIN_OWNED_SHARES, CONFIG, DENOM_DECIMALS, IS_FUND_CLOSED,
+        Config, ADMIN_FEE_POSITIONS, ADMIN_OWNED_SHARES, CONFIG, DENOM_DECIMALS, IS_FUND_CLOSED,
         LP_POSITIONS, LP_TOTAL_SUPPLY,
     },
     ContractError,
@@ -19,150 +19,99 @@ use super::{
     derivative_position_helpers::{
         apply_funding_to_position, get_vault_estimated_position_notional,
     },
-    oracle_price::get_oracle_price,
+    utils::get_spot_base_in_quote,
 };
 
 const ONE_YEAR_IN_SECONDS: u64 = 365 * 24 * 60 * 60;
 
-pub fn get_vault_redemption_response(
-    deps: DepsMut<InjectiveQueryWrapper>,
+pub fn ensure_valid_redemption(
     env: &Env,
-    sender: &Addr,
-    redeemer_subaccount_id: SubaccountId,
-) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let querier = InjectiveQuerier::new(&deps.querier);
-    let config = CONFIG.load(deps.storage)?;
-
-    let subaccount_id = config.subaccount_id;
-    let quote_denom = config.quote_denom;
-
-    let denom_decimals = DENOM_DECIMALS.load(deps.storage)?;
-    let quote_decimals = denom_decimals.get(&quote_denom).unwrap();
-
-    let deposit_quote_res = querier.query_subaccount_deposit(&subaccount_id, &quote_denom)?;
-    let vault_quote_total_balance = deposit_quote_res.deposits.total_balance;
-
+    subscription_time: Timestamp,
+    vault_quote_total_balance: FPDecimal,
+) -> Result<(), ContractError> {
     if vault_quote_total_balance < FPDecimal::zero() {
         return Err(ContractError::Std(StdError::generic_err(
             "Vault quote deposits are negative",
         )));
     }
 
-    let lp_total_supply = LP_TOTAL_SUPPLY.load(deps.storage)?;
-    let mut lp_positions = LP_POSITIONS.load(deps.storage)?;
-    let lp_position = lp_positions
-        .get(sender)
-        .ok_or(ContractError::Std(StdError::generic_err(
-            "Redeemer LP position does not exist",
-        )))?;
-
-    if env.block.time
-        <= lp_position
-            .subscription_time
-            .plus_seconds(ONE_YEAR_IN_SECONDS)
-    {
+    if env.block.time <= subscription_time.plus_seconds(ONE_YEAR_IN_SECONDS) {
         return Err(ContractError::Std(StdError::generic_err(
             "Redeemer LP position has not been updated",
         )));
     }
 
-    let lp_shares_to_burn = lp_position.shares;
+    Ok(())
+}
 
-    let mut funds_to_return = vec![];
+pub fn get_updated_redemption_notional_and_update_derivative_position_transfers(
+    mut total_redemption_notional: FPDecimal,
+    position_transfers: &mut Vec<PositionTransferAction>,
+    querier: &InjectiveQuerier,
+    market_id: &MarketId,
+    fund_subaccount_id: SubaccountId,
+    redeemer_subaccount_id: SubaccountId,
+    lp_shares_to_burn: FPDecimal,
+    lp_total_supply: FPDecimal,
+) -> Result<FPDecimal, ContractError> {
+    let vault_position = querier
+        .query_vanilla_subaccount_position(market_id, &fund_subaccount_id)?
+        .state;
 
-    let quote_withdrawal_amount = vault_quote_total_balance * lp_shares_to_burn / lp_total_supply;
-    funds_to_return.append(&mut vec![Coin {
-        denom: quote_denom,
-        amount: quote_withdrawal_amount.into(),
-    }]);
-
-    let mut total_redemption_notional = quote_withdrawal_amount;
-
-    for (index, market_id) in config.spot_market_ids.iter().enumerate() {
-        let market_res = querier.query_spot_market(market_id)?;
-        let market = market_res.market.expect("market should be available");
-
-        let deposit_base_res =
-            querier.query_subaccount_deposit(&subaccount_id, &market.base_denom)?;
-        let vault_base_total_balance = deposit_base_res.deposits.total_balance;
-
-        if vault_base_total_balance < FPDecimal::zero() {
-            return Err(ContractError::Std(StdError::generic_err(
-                "Vault base deposits are negative",
-            )));
-        }
-
-        let base_withdrawal_amount = vault_base_total_balance * lp_shares_to_burn / lp_total_supply;
-        funds_to_return.append(&mut vec![Coin {
-            denom: market.base_denom.to_owned(),
-            amount: base_withdrawal_amount.into(),
-        }]);
-
-        let oracle_type = config
-            .spot_oracle_types
-            .get(index)
-            .expect("oracle type should exist");
-        let base_decimals = denom_decimals.get(&market.base_denom).unwrap();
-        let oracle_price = get_oracle_price(
-            &querier,
-            oracle_type,
-            &market.base_denom,
-            &market.quote_denom,
-            *base_decimals,
-            *quote_decimals,
-        )?;
-        total_redemption_notional += base_withdrawal_amount * oracle_price;
-    }
-
-    let mut response = Response::new();
-    let mut position_transfers = vec![];
-
-    for (_, market_id) in config.derivative_market_ids.iter().enumerate() {
-        let vault_position = querier
-            .query_vanilla_subaccount_position(&market_id.to_owned(), &subaccount_id.to_owned())?
-            .state;
-
-        if let Some(mut p) = vault_position {
-            let position_transfer = PositionTransferAction {
-                market_id: market_id.to_owned(),
-                source_subaccount_id: subaccount_id.to_owned(),
-                destination_subaccount_id: redeemer_subaccount_id.to_owned(),
-                quantity: p.quantity * lp_shares_to_burn / lp_total_supply,
-            };
-            position_transfers.push(position_transfer);
-
-            let derivative_market_res = querier.query_derivative_market(market_id)?;
-            apply_funding_to_position(Some(&mut p), &derivative_market_res);
-
-            let position_notional = get_vault_estimated_position_notional(
-                Some(&mut Position {
-                    isLong: p.isLong,
-                    quantity: p.quantity * lp_shares_to_burn / lp_total_supply,
-                    entry_price: p.entry_price,
-                    margin: p.margin * lp_shares_to_burn / lp_total_supply,
-                    cumulative_funding_entry: p.cumulative_funding_entry,
-                }),
-                &derivative_market_res,
-            );
-            total_redemption_notional += position_notional;
+    if let Some(mut p) = vault_position {
+        let position_transfer = PositionTransferAction {
+            market_id: market_id.to_owned(),
+            source_subaccount_id: fund_subaccount_id,
+            destination_subaccount_id: redeemer_subaccount_id,
+            quantity: p.quantity * lp_shares_to_burn / lp_total_supply,
         };
-    }
+        position_transfers.push(position_transfer);
 
-    let total_profits = total_redemption_notional - lp_position.subscription_amount;
-    let should_charge_performance_fees =
-        total_profits > lp_position.subscription_amount * FPDecimal::from_str("1.1").unwrap();
+        let derivative_market_res = querier.query_derivative_market(market_id)?;
+        apply_funding_to_position(Some(&mut p), &derivative_market_res);
+
+        let position_notional = get_vault_estimated_position_notional(
+            Some(&mut Position {
+                isLong: p.isLong,
+                quantity: p.quantity * lp_shares_to_burn / lp_total_supply,
+                entry_price: p.entry_price,
+                margin: p.margin * lp_shares_to_burn / lp_total_supply,
+                cumulative_funding_entry: p.cumulative_funding_entry,
+            }),
+            &derivative_market_res,
+        );
+        total_redemption_notional += position_notional;
+    };
+
+    Ok(total_redemption_notional)
+}
+
+pub fn get_redemption_response(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    sender: &Addr,
+    config: &Config,
+    funds_to_return: &[Coin],
+    total_profits: FPDecimal,
+    total_redemption_notional: FPDecimal,
+    position_transfers: Vec<PositionTransferAction>,
+    should_charge_performance_fees: bool,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let mut response = Response::new();
 
     let mut admin_fee_positions = ADMIN_FEE_POSITIONS
         .may_load(deps.storage)?
         .unwrap_or_default();
 
-    if should_charge_performance_fees {
-        let performance_fee =
-            total_profits * config.performance_fee_rate / total_redemption_notional;
+    let performance_fee = total_profits * config.performance_fee_rate / total_redemption_notional;
 
-        for (_, coin) in funds_to_return.iter().enumerate() {
-            let admin_fee: Uint128 = (performance_fee * coin.amount.into()).into();
+    for (_, coin) in funds_to_return.iter().enumerate() {
+        let admin_fee: Uint128 = if should_charge_performance_fees {
+            (performance_fee * coin.amount.into()).into()
+        } else {
+            Uint128::zero()
+        };
 
+        if admin_fee > Uint128::zero() {
             let admin_send_message = BankMsg::Send {
                 to_address: config.admin.to_string(),
                 amount: vec![Coin {
@@ -171,20 +120,26 @@ pub fn get_vault_redemption_response(
                 }],
             };
             response = response.add_message(admin_send_message);
-
-            let redeemer_send_message = BankMsg::Send {
-                to_address: sender.to_string(),
-                amount: vec![Coin {
-                    denom: coin.denom.to_owned(),
-                    amount: coin.amount - admin_fee,
-                }],
-            };
-            response = response.add_message(redeemer_send_message);
         }
 
-        for (_, position_transfer) in position_transfers.iter().enumerate() {
-            let admin_fee_position_quantity = performance_fee * position_transfer.quantity;
+        let redeemer_send_message = BankMsg::Send {
+            to_address: sender.to_string(),
+            amount: vec![Coin {
+                denom: coin.denom.to_owned(),
+                amount: coin.amount - admin_fee,
+            }],
+        };
+        response = response.add_message(redeemer_send_message);
+    }
 
+    for (_, position_transfer) in position_transfers.iter().enumerate() {
+        let admin_fee_position_quantity: FPDecimal = if should_charge_performance_fees {
+            performance_fee * position_transfer.quantity
+        } else {
+            FPDecimal::zero()
+        };
+
+        if admin_fee_position_quantity > FPDecimal::zero() {
             let existing_admin_fee_position =
                 admin_fee_positions.get(&position_transfer.market_id.to_owned());
             let new_admin_fee_position_quantity = match existing_admin_fee_position {
@@ -195,33 +150,115 @@ pub fn get_vault_redemption_response(
                 position_transfer.market_id.to_owned(),
                 new_admin_fee_position_quantity,
             );
-
-            let redeemer_privileged_action = PrivilegedAction {
-                synthetic_trade: None,
-                position_transfer: Some(PositionTransferAction {
-                    market_id: position_transfer.market_id.to_owned(),
-                    source_subaccount_id: position_transfer.source_subaccount_id.to_owned(),
-                    destination_subaccount_id: position_transfer
-                        .destination_subaccount_id
-                        .to_owned(),
-                    quantity: position_transfer.quantity - admin_fee_position_quantity,
-                }),
-            };
-
-            response = response.set_data(to_binary(&Some(redeemer_privileged_action))?);
         }
+
+        let redeemer_privileged_action = PrivilegedAction {
+            synthetic_trade: None,
+            position_transfer: Some(PositionTransferAction {
+                market_id: position_transfer.market_id.to_owned(),
+                source_subaccount_id: position_transfer.source_subaccount_id.to_owned(),
+                destination_subaccount_id: position_transfer.destination_subaccount_id.to_owned(),
+                quantity: position_transfer.quantity - admin_fee_position_quantity,
+            }),
+        };
+
+        response = response.set_data(to_binary(&Some(redeemer_privileged_action))?);
     }
 
-    let new_lp_total_supply = lp_total_supply - lp_shares_to_burn;
-    LP_TOTAL_SUPPLY.save(deps.storage, &new_lp_total_supply)?;
+    if should_charge_performance_fees {
+        ADMIN_FEE_POSITIONS.save(deps.storage, &admin_fee_positions)?;
+    }
 
-    lp_positions.remove(sender);
-    LP_POSITIONS.save(deps.storage, &lp_positions)?;
+    Ok(response)
+}
 
-    ADMIN_FEE_POSITIONS.save(deps.storage, &admin_fee_positions)?;
+pub fn get_fund_redemption_response(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    env: &Env,
+    sender: &Addr,
+    redeemer_subaccount_id: SubaccountId,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let querier = InjectiveQuerier::new(&deps.querier);
+    let config = CONFIG.load(deps.storage)?;
+
+    let denom_decimals = DENOM_DECIMALS.load(deps.storage)?;
+    let lp_total_supply = LP_TOTAL_SUPPLY.load(deps.storage)?;
+    let mut lp_positions = LP_POSITIONS.load(deps.storage)?;
 
     let mut admin_owned_shares = ADMIN_OWNED_SHARES.load(deps.storage)?;
     let is_fund_closed = IS_FUND_CLOSED.may_load(deps.storage)?.unwrap_or_default();
+
+    let quote_decimals = denom_decimals.get(&config.quote_denom).unwrap();
+
+    let deposit_quote_res =
+        querier.query_subaccount_deposit(&config.fund_subaccount_id, &config.quote_denom)?;
+    let vault_quote_total_balance = deposit_quote_res.deposits.total_balance;
+
+    let lp_position = lp_positions
+        .get(sender)
+        .ok_or(ContractError::Std(StdError::generic_err(
+            "Redeemer LP position does not exist",
+        )))?;
+    let lp_shares_to_burn = lp_position.shares;
+
+    ensure_valid_redemption(
+        env,
+        lp_position.subscription_time,
+        vault_quote_total_balance,
+    )?;
+
+    let quote_withdrawal_amount = vault_quote_total_balance * lp_shares_to_burn / lp_total_supply;
+    let mut funds_to_return = vec![Coin {
+        denom: config.quote_denom.to_owned(),
+        amount: quote_withdrawal_amount.into(),
+    }];
+
+    let mut total_redemption_notional = quote_withdrawal_amount;
+
+    for (index, market_id) in config.spot_market_ids.iter().enumerate() {
+        let oracle_type = config
+            .spot_oracle_types
+            .get(index)
+            .expect("oracle type should exist");
+        total_redemption_notional += get_spot_base_in_quote(
+            &querier,
+            &config.fund_subaccount_id.to_owned(),
+            &market_id.to_owned(),
+            &denom_decimals,
+            quote_decimals,
+            oracle_type,
+            Some((lp_shares_to_burn, lp_total_supply, &mut funds_to_return)),
+        )?;
+    }
+
+    let mut position_transfers = vec![];
+
+    for (_, market_id) in config.derivative_market_ids.iter().enumerate() {
+        total_redemption_notional +=
+            get_updated_redemption_notional_and_update_derivative_position_transfers(
+                total_redemption_notional,
+                &mut position_transfers,
+                &querier,
+                market_id,
+                config.fund_subaccount_id.to_owned(),
+                redeemer_subaccount_id.to_owned(),
+                lp_shares_to_burn,
+                lp_total_supply,
+            )?;
+    }
+
+    let total_profits = total_redemption_notional - lp_position.subscription_amount;
+    let time_since_redemption = env.block.time.seconds() - lp_position.subscription_time.seconds();
+    let profits_per_year = total_profits * FPDecimal::from(ONE_YEAR_IN_SECONDS as u128)
+        / FPDecimal::from(time_since_redemption as u128);
+
+    let should_charge_performance_fees =
+        profits_per_year > lp_position.subscription_amount * config.min_yearly_roi_for_fees;
+
+    let new_lp_total_supply = lp_total_supply - lp_shares_to_burn;
+    LP_TOTAL_SUPPLY.save(deps.storage, &new_lp_total_supply)?;
+    lp_positions.remove(sender);
+    LP_POSITIONS.save(deps.storage, &lp_positions)?;
 
     if sender == &config.admin && !is_fund_closed {
         admin_owned_shares -= lp_shares_to_burn;
@@ -236,5 +273,14 @@ pub fn get_vault_redemption_response(
         return Ok(Response::new());
     }
 
-    Ok(response)
+    get_redemption_response(
+        deps,
+        sender,
+        &config,
+        &funds_to_return,
+        total_profits,
+        total_redemption_notional,
+        position_transfers,
+        should_charge_performance_fees,
+    )
 }
